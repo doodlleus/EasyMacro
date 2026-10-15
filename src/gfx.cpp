@@ -146,6 +146,11 @@ void Gfx_Text(const WCHAR* s, int n, int x, int y, int w, int h, HFONT f, COLORR
     DrawTextW(s_dc, s, n, &rc, fmt | DT_NOPREFIX);
 }
 
+void Gfx_Icon(HICON icon, int x, int y, int size)
+{
+    if (s_dc && icon) DrawIconEx(s_dc, x, y, icon, size, size, 0, NULL, DI_NORMAL);
+}
+
 int Gfx_TextW(const WCHAR* s, int n, HFONT f)
 {
     if (!s_dc) return 0;

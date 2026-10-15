@@ -1,5 +1,6 @@
 // Window content: a list of macro cards and an editor, custom drawn to match Windows 11.
 #include "app.h"
+#include <commdlg.h>
 
 #ifndef EM_SETCUEBANNER
 #define EM_SETCUEBANNER 0x1501
@@ -11,10 +12,13 @@
 #define GLYPH_KEYBOARD L"\xE765"
 #define GLYPH_WARNING  L"\xE7BA"
 #define GLYPH_INFO     L"\xE946"
+#define GLYPH_GLOBE    L"\xE774"
+#define GLYPH_APP      L"\xE8E5"
 #define ICON_DOT       L"\x0001"
 #define ICON_STOP      L"\x0002"
 
-HWND g_edit;
+HWND g_edit;                    // the macro name
+static HWND s_target;           // what an "open" macro launches
 
 static UINT s_dpi = 96;
 static inline int S(int v) { return MulDiv(v, (int)s_dpi, 96); }
@@ -77,6 +81,7 @@ void UI_LoadTheme()
     s_fieldBrush = CreateSolidBrush(T.field);
     s_fieldFocusBrush = CreateSolidBrush(T.fieldFocus);
     if (g_edit) InvalidateRect(g_edit, NULL, TRUE);
+    if (s_target) InvalidateRect(s_target, NULL, TRUE);
 }
 
 bool     UI_IsDark() { return T.dark; }
@@ -134,11 +139,13 @@ static void CreateFonts()
     ReleaseDC(NULL, dc);
     s_bodyH = tm.tmHeight;
     if (g_edit) SendMessageW(g_edit, WM_SETFONT, (WPARAM)fBody, FALSE);
+    if (s_target) SendMessageW(s_target, WM_SETFONT, (WPARAM)fBody, FALSE);
 }
 
 // ---- State ------------------------------------------------------------------------
 
-enum { H_NONE, H_NEW, H_CARD, H_TOGGLE, H_AUTOSTART, H_PAUSE, H_NAME, H_HOTKEY, H_RECORD, H_CLEAR, H_DELETE, H_CANCEL, H_SAVE };
+enum { H_NONE, H_NEW, H_CARD, H_TOGGLE, H_AUTOSTART, H_PAUSE, H_NAME, H_HOTKEY, H_ACTION, H_RECORD, H_CLEAR,
+       H_TARGET, H_BROWSE, H_DELETE, H_CANCEL, H_SAVE };
 #define HIT(type, index) (((type) << 8) | (index))
 
 struct Hit { RECT rc; int id; };
@@ -154,6 +161,7 @@ static struct Editor {
     int    index;               // macro being edited, -1 for a new one
     UINT   mods, vk;            // hotkey
     UINT   capMask;             // modifier keys held while capturing (bit per left/right key)
+    int    action;              // ACT_KEYS or ACT_OPEN
     int    mode;
     bool   confirmDelete;
     bool   msgError;
@@ -164,8 +172,46 @@ static struct Editor {
 } E;
 
 static KeyTok s_toks[MAX_EVT];
+static WCHAR  s_targetText[TARGET_LEN];
 
 static void Redraw() { InvalidateRect(g_wnd, NULL, FALSE); }
+
+// App icons for "open" macros, loaded while the window is open and released when it hides.
+static HICON s_cardIcons[MAX_MACROS];
+static BYTE  s_cardIconLoaded[MAX_MACROS];
+static HICON s_editIcon;
+static WCHAR s_editIconFor[TARGET_LEN];
+
+static void FreeIcons()
+{
+    for (int i = 0; i < MAX_MACROS; ++i) {
+        if (s_cardIcons[i]) DestroyIcon(s_cardIcons[i]);
+        s_cardIcons[i] = NULL;
+        s_cardIconLoaded[i] = 0;
+    }
+    if (s_editIcon) DestroyIcon(s_editIcon);
+    s_editIcon = NULL;
+    s_editIconFor[0] = 0;
+}
+
+static HICON CardIcon(int i)
+{
+    if (!s_cardIconLoaded[i]) {
+        s_cardIcons[i] = TargetIcon(g_macros[i].target);
+        s_cardIconLoaded[i] = 1;
+    }
+    return s_cardIcons[i];
+}
+
+static HICON EditorIcon(const WCHAR* target)
+{
+    if (lstrcmpW(target, s_editIconFor)) {
+        if (s_editIcon) DestroyIcon(s_editIcon);
+        s_editIcon = target[0] ? TargetIcon(target) : NULL;
+        lstrcpynW(s_editIconFor, target, TARGET_LEN);
+    }
+    return s_editIcon;
+}
 
 static void SetMsg(const WCHAR* text, bool error)
 {
@@ -275,24 +321,29 @@ enum { CHIP_KEY, CHIP_TRIGGER };
 
 // Draws key tokens as keycaps. With bottom > 0 the chips wrap onto new lines until bottom;
 // otherwise they stay on one line. Returns the x after the last chip, or -1 if cut short.
+static void ChipColors(int style, bool dim, COLORREF surface, COLORREF* bg, COLORREF* stroke, COLORREF* fg)
+{
+    if (style == CHIP_TRIGGER) {
+        *bg = Mix(surface, T.accent, T.dark ? 44 : 28);
+        *stroke = Mix(surface, T.accent, T.dark ? 110 : 90);
+        *fg = T.accent;
+    } else {
+        *bg = T.chip;
+        *stroke = T.chipStroke;
+        *fg = T.text;
+    }
+    if (dim) {
+        *bg = Mix(surface, *bg, 128);
+        *stroke = Mix(surface, *stroke, 128);
+        *fg = T.text3;
+    }
+}
+
 static int DrawChips(const KeyTok* t, int n, int x, int y, int right, int bottom, int h, HFONT f,
                      int style, bool dim, COLORREF surface)
 {
     COLORREF bg, stroke, fg;
-    if (style == CHIP_TRIGGER) {
-        bg = Mix(surface, T.accent, T.dark ? 44 : 28);
-        stroke = Mix(surface, T.accent, T.dark ? 110 : 90);
-        fg = T.accent;
-    } else {
-        bg = T.chip;
-        stroke = T.chipStroke;
-        fg = T.text;
-    }
-    if (dim) {
-        bg = Mix(surface, bg, 128);
-        stroke = Mix(surface, stroke, 128);
-        fg = T.text3;
-    }
+    ChipColors(style, dim, surface, &bg, &stroke, &fg);
     int left = x, pad = S(7), r = S(4), lineGap = S(6);
     int ellipsis = Gfx_TextW(L"\x2026", 1, f) + S(8);
     for (int i = 0; i < n; ++i) {
@@ -317,6 +368,24 @@ static int DrawChips(const KeyTok* t, int n, int x, int y, int right, int bottom
         x += cw;
     }
     return x;
+}
+
+// What an "open" macro launches, as a chip: the app's icon (or a glyph) and its name.
+static void DrawTargetChip(const WCHAR* target, HICON icon, int x, int y, int right, int h, bool dim, COLORREF surface)
+{
+    COLORREF bg, stroke, fg;
+    ChipColors(CHIP_KEY, dim, surface, &bg, &stroke, &fg);
+    WCHAR label[NAME_LEN];
+    TargetLabel(target, label, NAME_LEN);
+    int pad = S(7), iw = S(16), gap = S(6), r = S(4);
+    int cw = Min(pad + iw + gap + Gfx_TextW(label, -1, fSmall) + pad, right - x);
+    if (cw < h) return;
+    Gfx_Round(x, y, cw, h, (float)r, stroke);
+    Gfx_Round(x + 1, y + 1, cw - 2, h - 3, (float)(r - 1), bg);
+    if (icon) Gfx_Icon(icon, x + pad, y + (h - 1 - iw) / 2, iw);
+    else Gfx_Text(IsUrl(target) ? GLYPH_GLOBE : GLYPH_APP, 1, x + pad, y, iw, h - 1, fIconSm, fg, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+    Gfx_Text(label, -1, x + pad + iw + gap, y, cw - pad - iw - gap - pad / 2, h - 1, fSmall, fg,
+             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS);
 }
 
 static void Label(const WCHAR* text, int x, int y, int w, const WCHAR* hint, COLORREF hintColor)
@@ -369,8 +438,12 @@ static void PaintCard(int i, int x, int y, int w, int h)
     int cx = DrawChips(s_toks, n, left, cy, right, 0, ch, fSmall, CHIP_TRIGGER, dim, surface);
     if (cx >= 0 && cx + S(48) < right) {
         Gfx_Text(GLYPH_FORWARD, 1, cx, cy, S(28), ch, fIconSm, T.text3, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
-        n = FormatEvents(m.evt, m.nEvt, s_toks, MAX_EVT);
-        DrawChips(s_toks, n, cx + S(28), cy, right, 0, ch, fSmall, CHIP_KEY, dim, surface);
+        if (m.action == ACT_OPEN) {
+            DrawTargetChip(m.target, CardIcon(i), cx + S(28), cy, right, ch, dim, surface);
+        } else {
+            n = FormatEvents(m.evt, m.nEvt, s_toks, MAX_EVT);
+            DrawChips(s_toks, n, cx + S(28), cy, right, 0, ch, fSmall, CHIP_KEY, dim, surface);
+        }
     }
 }
 
@@ -434,20 +507,30 @@ static void PaintList(int W, int H)
 
 // ---- Editor -----------------------------------------------------------------------
 
-static const int kNameY = 90, kNameH = 36;
+// Editor layout, in DIPs.
+static const int kNameY = 90, kNameH = 36, kHotkeyY = 166, kHotkeyH = 48, kActionY = 230;
+static const int kFieldY = 262, kKeysH = 104, kTargetH = 36, kBrowseW = 100;
 
+// Positions the two text boxes (name, and the target in "open" mode) over their fields.
 static void LayoutEdit()
 {
     if (!g_edit) return;
-    if (s_view != VIEW_EDIT) {
-        ShowWindow(g_edit, SW_HIDE);
-        return;
-    }
+    bool editing = s_view == VIEW_EDIT, open = editing && E.action == ACT_OPEN;
+    HWND focus = GetFocus();
+    if ((focus == g_edit && !editing) || (focus == s_target && !open)) SetFocus(g_wnd);
+
     RECT rc;
     GetClientRect(g_wnd, &rc);
-    int pad = S(20);
-    SetWindowPos(g_edit, NULL, pad + S(12), S(kNameY) + (S(kNameH) - s_bodyH) / 2, rc.right - 2 * pad - S(24), s_bodyH,
-                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    int  pad = S(20), fw = rc.right - 2 * pad;
+    UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+    if (editing) SetWindowPos(g_edit, NULL, pad + S(12), S(kNameY) + (S(kNameH) - s_bodyH) / 2, fw - S(24), s_bodyH, flags);
+    else ShowWindow(g_edit, SW_HIDE);
+    if (open) {
+        int fieldW = fw - S(kBrowseW) - S(8);
+        SetWindowPos(s_target, NULL, pad + S(36), S(kFieldY) + (S(kTargetH) - s_bodyH) / 2, fieldW - S(46), s_bodyH, flags);
+    } else {
+        ShowWindow(s_target, SW_HIDE);
+    }
 }
 
 static int ModIndex(UINT vk)
@@ -557,11 +640,14 @@ static void OpenEditor(int index)
         const Macro& m = g_macros[index];
         E.mods = m.mods;
         E.vk = m.vk;
+        E.action = m.action;
         E.nEvt = m.nEvt;
         CopyMemory(E.evt, m.evt, m.nEvt * sizeof(KeyEvt));
         SetWindowTextW(g_edit, m.name);
+        SetWindowTextW(s_target, m.target);
     } else {
         SetWindowTextW(g_edit, L"");
+        SetWindowTextW(s_target, L"");
     }
     s_view = VIEW_EDIT;
     s_hover = 0;
@@ -575,7 +661,6 @@ static void CloseEditor()
 {
     StopInput();
     s_view = VIEW_LIST;
-    if (GetFocus() == g_edit) SetFocus(g_wnd);
     LayoutEdit();
     s_hover = 0;
     Redraw();
@@ -583,7 +668,7 @@ static void CloseEditor()
     RefreshHover();
 }
 
-static void TrimName(WCHAR* s)
+static void Trim(WCHAR* s)
 {
     int len = lstrlenW(s), start = 0;
     while (len > 0 && s[len - 1] == L' ') --len;
@@ -595,8 +680,13 @@ static void TrimName(WCHAR* s)
 static void SaveEditor()
 {
     StopInput();
+    GetWindowTextW(s_target, s_targetText, TARGET_LEN);
+    Trim(s_targetText);
+    bool open = E.action == ACT_OPEN;
     if (!E.vk) { SetMsg(L"Set a hotkey first.", true); return; }
-    if (!E.nEvt) { SetMsg(L"Record the keys this macro should send.", true); return; }
+    if (!open && !E.nEvt) { SetMsg(L"Record the keys this macro should send.", true); return; }
+    if (open && !s_targetText[0]) { SetMsg(L"Choose an app, file, folder or web address to open.", true); return; }
+    if (open && TargetMissing(s_targetText)) { SetMsg(L"EasyMacro can't find that file or folder. Check the path, or use Browse.", true); return; }
     if (!CheckHotkey(E.mods, E.vk)) return;
 
     int i = E.index;
@@ -610,11 +700,19 @@ static void SaveEditor()
     Macro& m = g_macros[i];
     m.mods = E.mods;
     m.vk = E.vk;
+    m.action = (BYTE)E.action;
     m.nEvt = (WORD)E.nEvt;
     CopyMemory(m.evt, E.evt, E.nEvt * sizeof(KeyEvt));
+    lstrcpynW(m.target, s_targetText, TARGET_LEN);
     GetWindowTextW(g_edit, m.name, NAME_LEN);
-    TrimName(m.name);
-    if (!m.name[0]) TokensToText(s_toks, FormatEvents(m.evt, m.nEvt, s_toks, MAX_EVT), m.name, NAME_LEN);
+    Trim(m.name);
+    if (!m.name[0] && open) {
+        WCHAR label[NAME_LEN - 5];
+        TargetLabel(m.target, label, ARRAYSIZE(label));
+        wsprintfW(m.name, L"Open %s", label);
+    } else if (!m.name[0]) {
+        TokensToText(s_toks, FormatEvents(m.evt, m.nEvt, s_toks, MAX_EVT), m.name, NAME_LEN);
+    }
     CloseEditor();
     App_MacrosChanged();
 }
@@ -634,6 +732,52 @@ static void DeleteMacro()
     App_MacrosChanged();
 }
 
+// "Send keys | Open app" tabs, with an accent pill under the selected one.
+static void DrawSelector(int x, int y)
+{
+    static const WCHAR* items[2] = { L"Send keys", L"Open app" };
+    for (int i = 0; i < 2; ++i) {
+        int  id = HIT(H_ACTION, i), tw = Gfx_TextW(items[i], -1, fSemi);
+        bool selected = E.action == i;
+        Gfx_Text(items[i], -1, x, y, tw + S(2), S(20), fSemi, selected || s_hover == id ? T.text : T.text2, DT_SINGLELINE | DT_VCENTER);
+        if (selected) Gfx_Round(x + (tw - S(16)) / 2, y + S(24), S(16), S(3), S(3) / 2.f, T.accent);
+        AddHit(x - S(8), y - S(6), tw + S(16), S(36), id);
+        x += tw + S(28);
+    }
+}
+
+// Lets the user pick an app or shortcut. comdlg32 is loaded only when this is first used.
+static void BrowseTarget()
+{
+    typedef BOOL (WINAPI* GetOpenFileNameFn)(OPENFILENAMEW*);
+    static GetOpenFileNameFn getOpenFileName;
+    StopInput();
+    if (!getOpenFileName) {
+        if (HMODULE dlg = LoadLibraryExW(L"comdlg32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32))
+            getOpenFileName = (GetOpenFileNameFn)GetProcAddress(dlg, "GetOpenFileNameW");
+        if (!getOpenFileName) return;
+    }
+    EnsureCom();
+    static WCHAR file[MAX_PATH];
+    WCHAR startIn[MAX_PATH];
+    file[0] = 0;
+    ExpandEnvironmentStringsW(L"%ProgramData%\\Microsoft\\Windows\\Start Menu\\Programs", startIn, MAX_PATH);
+
+    OPENFILENAMEW ofn = {};
+    ofn.lStructSize = sizeof(ofn);
+    ofn.hwndOwner = g_wnd;
+    ofn.lpstrFilter = L"Apps and shortcuts\0*.exe;*.lnk;*.url;*.appref-ms;*.bat;*.cmd;*.ps1;*.msc\0All files\0*.*\0";
+    ofn.lpstrFile = file;
+    ofn.nMaxFile = MAX_PATH;
+    ofn.lpstrInitialDir = startIn;
+    ofn.lpstrTitle = L"Choose what this hotkey opens";
+    ofn.Flags = OFN_EXPLORER | OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NODEREFERENCELINKS | OFN_HIDEREADONLY | OFN_DONTADDTORECENT;
+    if (getOpenFileName(&ofn)) {
+        SetWindowTextW(s_target, file);
+        SetMsg(NULL, false);
+    }
+}
+
 static void PaintEditor(int W, int H)
 {
     int pad = S(20), fw = W - 2 * pad, inset = S(12), chipH = S(28);
@@ -645,7 +789,7 @@ static void PaintEditor(int W, int H)
     AddHit(pad, S(kNameY), fw, S(kNameH), HIT(H_NAME, 0));
 
     // Hotkey
-    int  hotId = HIT(H_HOTKEY, 0), hy = S(166), hh = S(48);
+    int  hotId = HIT(H_HOTKEY, 0), hy = S(kHotkeyY), hh = S(kHotkeyH);
     bool capturing = E.mode == ED_CAPTURE;
     Label(L"Hotkey", pad, S(142), fw, capturing ? L"Esc to cancel" : E.vk ? L"Click to change" : NULL, T.text3);
     int state = capturing ? FIELD_ACTIVE : s_hover == hotId ? FIELD_HOVER : FIELD_NORMAL;
@@ -666,38 +810,55 @@ static void PaintEditor(int W, int H)
         Gfx_Text(L"Click here, then press a key combination", -1, pad + inset, hy, fw - 2 * inset, hh, fBody, T.text3, DT_SINGLELINE | DT_VCENTER);
     }
 
-    // Keys to send
-    bool  recording = E.mode == ED_RECORD;
-    int   strokes = 0, ky = S(254), kh = S(100);
+    // What the hotkey does: send keys, or open something
+    bool  recording = E.mode == ED_RECORD, open = E.action == ACT_OPEN;
+    int   strokes = 0, top = S(kFieldY), bh = S(32), my;
     WCHAR hint[32] = L"";
     for (int i = 0; i < E.nEvt; ++i) strokes += !(E.evt[i].flags & EVT_UP);
     if (recording) lstrcpyW(hint, L"\x25CF  Recording");
+    else if (open) hint[0] = 0;
     else if (strokes == 1) lstrcpyW(hint, L"1 keystroke");
     else if (strokes) wsprintfW(hint, L"%d keystrokes", strokes);
-    Label(L"Keys to send", pad, S(230), fw, hint[0] ? hint : NULL, recording ? T.rec : T.text3);
-    DrawField(pad, ky, fw, kh, recording ? FIELD_RECORD : FIELD_NORMAL);
-    if (E.nEvt) {
-        int n = FormatEvents(E.evt, E.nEvt, s_toks, MAX_EVT);
-        DrawChips(s_toks, n, pad + inset, ky + inset, right, ky + kh - inset, chipH, fBody, CHIP_KEY, false, T.field);
-    } else {
-        Gfx_Text(recording ? L"Type the keys now. Everything you press is captured until you click Stop."
-                           : L"Click Record, then press the keys you want this hotkey to send.",
-                 -1, pad + inset, ky + inset, fw - 2 * inset, kh - 2 * inset, fBody, T.text3, DT_WORDBREAK);
-    }
+    DrawSelector(pad, S(kActionY));
+    if (hint[0]) Gfx_Text(hint, -1, pad, S(kActionY), fw, S(20), fSmall, recording ? T.rec : T.text3, DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
 
-    int by = S(366), bh = S(32);
-    if (recording) {
-        DrawButton(pad, by, Max(S(104), ButtonWidth(ICON_STOP, L"Stop")), bh, ICON_STOP, L"Stop", BTN_DANGER, HIT(H_RECORD, 0));
+    if (open) {
+        int th = S(kTargetH), fieldW = fw - S(kBrowseW) - S(8), iw = S(16);
+        DrawField(pad, top, fieldW, th, GetFocus() == s_target ? FIELD_FOCUS : FIELD_NORMAL);
+        AddHit(pad, top, fieldW, th, HIT(H_TARGET, 0));
+        GetWindowTextW(s_target, s_targetText, TARGET_LEN);
+        if (HICON icon = EditorIcon(s_targetText)) Gfx_Icon(icon, pad + S(12), top + (th - iw) / 2, iw);
+        else Gfx_Text(IsUrl(s_targetText) ? GLYPH_GLOBE : GLYPH_APP, 1, pad + S(12), top, iw, th, fIcon, T.text3, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        DrawButton(pad + fieldW + S(8), top, S(kBrowseW), th, NULL, L"Browse\x2026", BTN_STD, HIT(H_BROWSE, 0));
+        Gfx_Text(L"An app, file, folder or web address. To pass arguments, put the path in quotes first, "
+                 L"e.g. \"C:\\Tools\\app.exe\" --new-window",
+                 -1, pad, top + th + S(10), fw, S(40), fSmall, T.text3, DT_WORDBREAK);
+        my = top + th + S(62);
     } else {
-        const WCHAR* label = E.nEvt ? L"Re-record" : L"Record";
-        int rw = Max(S(104), ButtonWidth(ICON_DOT, label));
-        DrawButton(pad, by, rw, bh, ICON_DOT, label, BTN_STD, HIT(H_RECORD, 0));
-        if (E.nEvt) DrawButton(pad + rw + S(8), by, S(80), bh, NULL, L"Clear", BTN_SUBTLE, HIT(H_CLEAR, 0));
+        int kh = S(kKeysH);
+        DrawField(pad, top, fw, kh, recording ? FIELD_RECORD : FIELD_NORMAL);
+        if (E.nEvt) {
+            int n = FormatEvents(E.evt, E.nEvt, s_toks, MAX_EVT);
+            DrawChips(s_toks, n, pad + inset, top + inset, right, top + kh - inset, chipH, fBody, CHIP_KEY, false, T.field);
+        } else {
+            Gfx_Text(recording ? L"Type the keys now. Everything you press is captured until you click Stop."
+                               : L"Click Record, then press the keys you want this hotkey to send.",
+                     -1, pad + inset, top + inset, fw - 2 * inset, kh - 2 * inset, fBody, T.text3, DT_WORDBREAK);
+        }
+        int by = top + kh + S(12);
+        if (recording) {
+            DrawButton(pad, by, Max(S(104), ButtonWidth(ICON_STOP, L"Stop")), bh, ICON_STOP, L"Stop", BTN_DANGER, HIT(H_RECORD, 0));
+        } else {
+            const WCHAR* label = E.nEvt ? L"Re-record" : L"Record";
+            int rw = Max(S(104), ButtonWidth(ICON_DOT, label));
+            DrawButton(pad, by, rw, bh, ICON_DOT, label, BTN_STD, HIT(H_RECORD, 0));
+            if (E.nEvt) DrawButton(pad + rw + S(8), by, S(80), bh, NULL, L"Clear", BTN_SUBTLE, HIT(H_CLEAR, 0));
+        }
+        my = by + bh + S(16);
     }
 
     if (E.msg[0]) {
         COLORREF c = E.msgError ? T.danger : T.text2;
-        int my = S(414);
         Gfx_Text(E.msgError ? GLYPH_WARNING : GLYPH_INFO, 1, pad, my, S(16), S(20), fIcon, c, DT_SINGLELINE | DT_VCENTER);
         Gfx_Text(E.msg, -1, pad + S(26), my + S(1), fw - S(26), S(60), fBody, c, DT_WORDBREAK);
     }
@@ -705,7 +866,7 @@ static void PaintEditor(int W, int H)
     // Footer
     int fy = H - S(64), y2 = fy + S(16), bw = S(96);
     Gfx_Fill(0, fy, W, 1, T.divider);
-    bool valid = E.vk && E.nEvt && E.mode == ED_IDLE;
+    bool valid = E.vk && (open ? GetWindowTextLengthW(s_target) > 0 : E.nEvt > 0) && E.mode == ED_IDLE;
     DrawButton(W - pad - bw, y2, bw, bh, NULL, L"Save", valid ? BTN_ACCENT : BTN_DISABLED, HIT(H_SAVE, 0));
     DrawButton(W - pad - 2 * bw - S(8), y2, bw, bh, NULL, L"Cancel", BTN_STD, HIT(H_CANCEL, 0));
     if (E.index >= 0) {
@@ -728,8 +889,17 @@ static void OnClick(int id)
     case H_AUTOSTART: App_SetAutostart(!g_autostart); break;
     case H_PAUSE:     App_SetPaused(!g_paused); break;
     case H_HOTKEY:    if (E.mode == ED_CAPTURE) CancelCapture(); else StartCapture(); break;
+    case H_ACTION:
+        if (E.action != i) {
+            StopInput();
+            E.action = i;
+            SetMsg(NULL, false);
+            LayoutEdit();
+        }
+        break;
     case H_RECORD:    if (E.mode == ED_RECORD) FinishRecording(); else StartRecording(); break;
     case H_CLEAR:     E.nEvt = 0; SetMsg(NULL, false); break;
+    case H_BROWSE:    BrowseTarget(); break;
     case H_DELETE:    DeleteMacro(); break;
     case H_CANCEL:    CloseEditor(); break;
     case H_SAVE:      SaveEditor(); break;
@@ -765,11 +935,12 @@ LRESULT UI_Mouse(UINT msg, WPARAM wp, LPARAM lp)
         SetCapture(g_wnd);
         int type = s_press >> 8;
         if (E.mode == ED_CAPTURE && type != H_HOTKEY) CancelCapture();
-        if (type == H_NAME) {
-            SetFocus(g_edit);
-            int len = GetWindowTextLengthW(g_edit);
-            SendMessageW(g_edit, EM_SETSEL, len, len);
-        } else if (GetFocus() == g_edit) {
+        if (type == H_NAME || type == H_TARGET) {
+            HWND edit = type == H_NAME ? g_edit : s_target;
+            SetFocus(edit);
+            int len = GetWindowTextLengthW(edit);
+            SendMessageW(edit, EM_SETSEL, len, len);
+        } else if (GetFocus() == g_edit || GetFocus() == s_target) {
             SetFocus(g_wnd);
         }
         Redraw();
@@ -801,7 +972,7 @@ LRESULT UI_Mouse(UINT msg, WPARAM wp, LPARAM lp)
     return 0;
 }
 
-bool UI_WantsIBeam() { return s_view == VIEW_EDIT && s_hover == HIT(H_NAME, 0); }
+bool UI_WantsIBeam() { return s_view == VIEW_EDIT && (s_hover == HIT(H_NAME, 0) || s_hover == HIT(H_TARGET, 0)); }
 
 bool UI_KeyDown(WPARAM vk)
 {
@@ -850,18 +1021,20 @@ void UI_HookKey(WPARAM info, LPARAM scan)
     Redraw();
 }
 
-void UI_EditNotify(UINT code)
+void UI_EditNotify(UINT id, UINT code)
 {
+    HWND edit = id == ID_TARGET ? s_target : g_edit;
     if (code == EN_SETFOCUS) StopInput();
     if (code == EN_SETFOCUS || code == EN_KILLFOCUS) {
-        InvalidateRect(g_edit, NULL, TRUE);
+        InvalidateRect(edit, NULL, TRUE);
         Redraw();
     }
+    if (code == EN_CHANGE && id == ID_TARGET) Redraw();    // icon and Save button follow the text
 }
 
-LRESULT UI_EditColor(HDC dc)
+LRESULT UI_EditColor(HDC dc, HWND edit)
 {
-    bool focus = GetFocus() == g_edit;
+    bool focus = GetFocus() == edit;
     SetTextColor(dc, T.text);
     SetBkColor(dc, focus ? T.fieldFocus : T.field);
     return (LRESULT)(focus ? s_fieldFocusBrush : s_fieldBrush);
@@ -879,10 +1052,17 @@ void UI_Hidden()
 {
     StopInput();
     s_hover = s_press = 0;
+    FreeIcons();
     Gfx_Free();
 }
 
 void UI_Refresh() { Redraw(); }
+
+void UI_MacrosChanged()
+{
+    FreeIcons();                // card positions may have shifted
+    Redraw();
+}
 
 void UI_SetDpi(UINT dpi)
 {
@@ -914,6 +1094,10 @@ void UI_Create(HWND wnd)
     g_edit = CreateWindowExW(0, L"EDIT", NULL, WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, wnd, (HMENU)(INT_PTR)ID_EDIT, g_inst, NULL);
     SendMessageW(g_edit, EM_SETLIMITTEXT, NAME_LEN - 1, 0);
     SendMessageW(g_edit, EM_SETCUEBANNER, FALSE, (LPARAM)L"e.g. Copy and paste");
+    s_target = CreateWindowExW(0, L"EDIT", NULL, WS_CHILD | ES_AUTOHSCROLL, 0, 0, 0, 0, wnd, (HMENU)(INT_PTR)ID_TARGET, g_inst, NULL);
+    SendMessageW(s_target, EM_SETLIMITTEXT, TARGET_LEN - 1, 0);
+    SendMessageW(s_target, EM_SETCUEBANNER, FALSE, (LPARAM)L"e.g. notepad, or https://github.com");
     CreateFonts();
     SendMessageW(g_edit, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
+    SendMessageW(s_target, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, 0);
 }

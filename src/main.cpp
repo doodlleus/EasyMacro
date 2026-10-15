@@ -181,7 +181,7 @@ void App_MacrosChanged()
     RegisterAll();
     SaveMacros();
     Tray(NIM_MODIFY);
-    UI_Refresh();
+    UI_MacrosChanged();
 }
 
 // ---- Window -------------------------------------------------------------------------
@@ -207,10 +207,10 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     case WM_COMMAND:
-        if (LOWORD(wp) == ID_EDIT) UI_EditNotify(HIWORD(wp));
+        if (LOWORD(wp) == ID_EDIT || LOWORD(wp) == ID_TARGET) UI_EditNotify(LOWORD(wp), HIWORD(wp));
         return 0;
     case WM_CTLCOLOREDIT:
-        return UI_EditColor((HDC)wp);
+        return UI_EditColor((HDC)wp, (HWND)lp);
     case WM_HOTKEY: {
         // A macro that types its own hotkey would retrigger itself forever, so ignore
         // hotkeys raised while (or just after) our own keystrokes were being sent.
@@ -219,7 +219,8 @@ static LRESULT CALLBACK WndProc(HWND wnd, UINT msg, WPARAM wp, LPARAM lp)
         if (i >= 0 && i < g_count && g_macros[i].enabled && !g_paused) {
             s_playStart = GetTickCount();
             s_played = true;
-            PlayMacro(&g_macros[i]);
+            if (g_macros[i].action == ACT_OPEN) LaunchTarget(g_macros[i].target);
+            else PlayMacro(&g_macros[i]);
         }
         return 0;
     }

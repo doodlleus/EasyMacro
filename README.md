@@ -1,8 +1,9 @@
 # EasyMacro
 
-A tiny Windows tray app that types a recorded key sequence when you press a hotkey.
+A tiny Windows tray app that types a recorded key sequence, or opens an app, when you press a hotkey.
 
 - Record any keys or shortcuts, such as `Ctrl+Shift+Esc`, `Ctrl+C, Ctrl+V` or a line of text.
+- Or open something: an app, file, folder or website.
 - Assign it to any hotkey: `F9`, `Ctrl+Alt+T`, `Win+Shift+K` and so on.
 - Lives in the system tray. It follows the Windows light/dark theme and accent color, and scales cleanly on high-DPI displays.
 
@@ -12,16 +13,18 @@ EasyMacro is native Win32 code, built without the C runtime. The whole program i
 
 | | |
 |---|---|
-| Idle in the tray | ~250 KB private memory, 0% CPU |
+| Idle in the tray | under 0.5 MB private memory, 0% CPU |
 | Window open | ~3 MB private memory |
 
-It does no polling and sets no timers. Hotkeys are registered with Windows (`RegisterHotKey`), so EasyMacro sleeps until one is pressed. A keyboard hook is installed only while you are recording or setting a hotkey, and is removed as soon as you finish.
+It does no polling and sets no timers. Hotkeys are registered with Windows (`RegisterHotKey`), so EasyMacro sleeps until one is pressed. A keyboard hook is installed only while you are recording or setting a hotkey, and is removed as soon as you finish. The file picker and app icons are loaded only when you use them.
 
 ## Using it
 
 1. Click **New macro**.
 2. Click the **Hotkey** box and press the shortcut that should trigger the macro.
-3. Click **Record**, type the keys to send, then click **Stop**. While recording, your keystrokes are captured and do not reach other apps.
+3. Choose what the hotkey does:
+   - **Send keys:** click **Record**, type the keys to send, then click **Stop**. While recording, your keystrokes are captured and do not reach other apps.
+   - **Open app:** click **Browse…** to pick an app or shortcut, or type a path, a program name like `notepad`, a folder, or a web address. To pass arguments, put the path in quotes first: `"C:\Tools\app.exe" --new-window`. Environment variables such as `%USERPROFILE%` work too.
 4. Click **Save**. The hotkey works everywhere until you pause it.
 
 Closing the window keeps EasyMacro running in the tray. Click the tray icon to reopen it, or right-click it to pause hotkeys, toggle **Start with Windows**, or exit. In the list, each macro has its own on/off switch, and you can click a macro to edit or delete it.
@@ -50,5 +53,5 @@ This produces `build\EasyMacro.exe`. To regenerate the icons in `res\`, run `pow
 | `src/main.cpp` | Entry point, tray icon, window and theme |
 | `src/ui.cpp` | The list and editor views (custom drawn) |
 | `src/gfx.cpp` | A small renderer: antialiased rounded shapes, with text drawn by GDI |
-| `src/macro.cpp` | Recording hook, playback, hotkeys, key names, settings |
+| `src/macro.cpp` | Recording hook, playback, opening apps, hotkeys, key names, settings |
 | `src/crt.cpp` | The few C runtime symbols the compiler needs when building without the CRT |

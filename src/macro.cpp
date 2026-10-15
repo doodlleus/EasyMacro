@@ -270,6 +270,167 @@ void PlayMacro(const Macro* m)
     SendInput(n, s_input, sizeof(INPUT));
 }
 
+// ---- Opening apps, files and URLs -----------------------------------------------------
+// A target is a path, a bare program name ("notepad") or a URL. Arguments can follow a
+// quoted path: "C:\Tools\app.exe" --flag. Environment variables like %USERPROFILE% expand.
+
+static WCHAR s_file[TARGET_LEN * 2], s_params[TARGET_LEN * 2];
+
+// The shell may hand work to COM-based extensions; initialized on first use only.
+void EnsureCom()
+{
+    typedef HRESULT (WINAPI* CoInitializeExFn)(LPVOID, DWORD);
+    static bool done;
+    if (done) return;
+    done = true;
+    if (HMODULE ole = LoadLibraryExW(L"ole32.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32)) {
+        if (auto init = (CoInitializeExFn)GetProcAddress(ole, "CoInitializeEx"))
+            init(NULL, 0x2 | 0x4);              // COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE
+    }
+}
+
+// "https://...", "mailto:...", "ms-settings:..." - a scheme of two or more characters
+// (one character would be a drive letter).
+bool IsUrl(const WCHAR* s)
+{
+    int n = 0;
+    for (; s[n]; ++n) {
+        WCHAR c = s[n];
+        if (c == ':') return n >= 2;
+        if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (n && ((c >= '0' && c <= '9') || c == '+' || c == '-' || c == '.'))))
+            return false;
+    }
+    return false;
+}
+
+static bool HasPath(const WCHAR* s)
+{
+    for (; *s; ++s) {
+        if (*s == '\\' || *s == '/' || *s == ':') return true;
+    }
+    return false;
+}
+
+// Splits a target into s_file and s_params, after expanding environment variables.
+static void SplitTarget(const WCHAR* target)
+{
+    WCHAR* buf = s_params;                      // expand into s_params, then split into place
+    DWORD  n = ExpandEnvironmentStringsW(target, buf, ARRAYSIZE(s_params));
+    if (!n || n > ARRAYSIZE(s_params)) lstrcpynW(buf, target, ARRAYSIZE(s_params));
+    while (*buf == ' ') ++buf;
+    int len = lstrlenW(buf);
+    while (len && buf[len - 1] == ' ') buf[--len] = 0;
+
+    WCHAR* rest = buf + len;
+    if (buf[0] == '"') {
+        WCHAR* end = buf + 1;
+        while (*end && *end != '"') ++end;
+        lstrcpynW(s_file, buf + 1, (int)Min<INT_PTR>(end - buf, ARRAYSIZE(s_file)));
+        rest = *end ? end + 1 : end;
+    } else if (IsUrl(buf) || GetFileAttributesW(buf) != INVALID_FILE_ATTRIBUTES) {
+        lstrcpynW(s_file, buf, ARRAYSIZE(s_file));
+    } else {
+        WCHAR* space = buf;
+        while (*space && *space != ' ') ++space;
+        lstrcpynW(s_file, buf, (int)Min<INT_PTR>(space - buf + 1, ARRAYSIZE(s_file)));
+        rest = space;
+    }
+    while (*rest == ' ') ++rest;
+    MoveMemory(s_params, rest, (lstrlenW(rest) + 1) * sizeof(WCHAR));
+}
+
+// Full path of the target's file, searching PATH for bare names like "notepad".
+static bool FindTargetFile(WCHAR* out, int cch)
+{
+    if (!s_file[0] || IsUrl(s_file)) return false;
+    if (GetFileAttributesW(s_file) != INVALID_FILE_ATTRIBUTES) {
+        lstrcpynW(out, s_file, cch);
+        return true;
+    }
+    return !HasPath(s_file) && SearchPathW(NULL, s_file, L".exe", cch, out, NULL) > 0;
+}
+
+// A short display name: the file name without its extension, or a URL's host.
+void TargetLabel(const WCHAR* target, WCHAR* out, int cch)
+{
+    SplitTarget(target);
+    const WCHAR* s = s_file;
+    int len = lstrlenW(s);
+    if (IsUrl(s)) {
+        for (const WCHAR* p = s; *p; ++p) {
+            if (p[0] == ':' && p[1] == '/' && p[2] == '/') {
+                s = p + 3;
+                if (CompareStringOrdinal(s, Min(4, lstrlenW(s)), L"www.", 4, TRUE) == CSTR_EQUAL) s += 4;
+                for (len = 0; s[len] && s[len] != '/' && s[len] != '?' && s[len] != '#'; ++len) {}
+                break;
+            }
+        }
+    } else {
+        while (len > 1 && (s[len - 1] == '\\' || s[len - 1] == '/')) --len;     // "C:\Folder\"
+        for (int i = len - 1; i >= 0; --i) {
+            if (s[i] == '\\' || s[i] == '/') {
+                s += i + 1;
+                len -= i + 1;
+                break;
+            }
+        }
+        for (int i = len - 1; i > 0; --i) {
+            if (s[i] == '.') {
+                len = i;
+                break;
+            }
+        }
+    }
+    lstrcpynW(out, s, Min(len + 1, cch));
+}
+
+// True for a path that doesn't exist. Bare names and URLs are left for the shell to resolve.
+bool TargetMissing(const WCHAR* target)
+{
+    SplitTarget(target);
+    return !IsUrl(s_file) && HasPath(s_file) && GetFileAttributesW(s_file) == INVALID_FILE_ATTRIBUTES;
+}
+
+HICON TargetIcon(const WCHAR* target)
+{
+    SplitTarget(target);
+    WCHAR path[MAX_PATH];
+    if (!FindTargetFile(path, MAX_PATH)) return NULL;
+    EnsureCom();
+    SHFILEINFOW info = {};
+    return SHGetFileInfoW(path, 0, &info, sizeof(info), SHGFI_ICON | SHGFI_SMALLICON) ? info.hIcon : NULL;
+}
+
+void LaunchTarget(const WCHAR* target)
+{
+    SplitTarget(target);
+    if (!s_file[0]) return;
+    EnsureCom();
+
+    // Start programs in their own folder; some look for files next to themselves.
+    WCHAR dir[MAX_PATH] = L"";
+    DWORD attrs = IsUrl(s_file) ? INVALID_FILE_ATTRIBUTES : GetFileAttributesW(s_file);
+    if (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY)) {
+        lstrcpynW(dir, s_file, MAX_PATH);
+        WCHAR* slash = NULL;
+        for (WCHAR* p = dir; *p; ++p) {
+            if (*p == '\\' || *p == '/') slash = p;
+        }
+        if (slash) slash[slash == dir + 2 ? 1 : 0] = 0;     // keep the backslash in "C:\"
+        else dir[0] = 0;
+    }
+
+    // The hotkey gave us the right to take the foreground; pass it on so the app (or an
+    // already-running instance it hands off to) comes to the front.
+    AllowSetForegroundWindow(ASFW_ANY);
+    SHELLEXECUTEINFOW sei = { sizeof(sei) };
+    sei.lpFile = s_file;
+    sei.lpParameters = s_params[0] ? s_params : NULL;
+    sei.lpDirectory = dir[0] ? dir : NULL;
+    sei.nShow = SW_SHOWNORMAL;
+    ShellExecuteExW(&sei);
+}
+
 // ---- Hotkeys --------------------------------------------------------------------
 
 void RegisterAll()
@@ -366,6 +527,7 @@ void HookStop()
 // ---- Storage ----------------------------------------------------------------------
 // %APPDATA%\EasyMacro\macros.cfg, UTF-8, one macro per line:
 //   M <tab> enabled <tab> mods <tab> vk <tab> events (vk scan flags, 2 hex digits each) <tab> name
+//   O <tab> enabled <tab> mods <tab> vk <tab> target <tab> name
 
 static WCHAR s_line[64 + MAX_EVT * 6 + NAME_LEN];
 static char  s_utf8[sizeof(s_line) / sizeof(WCHAR) * 3];
@@ -419,17 +581,22 @@ void SaveMacros()
     bool ok = WriteLine(f, s_line, n);
     for (int i = 0; i < g_count && ok; ++i) {
         const Macro& m = g_macros[i];
+        bool open = m.action == ACT_OPEN;
         WCHAR* p = s_line;
-        *p++ = 'M'; *p++ = '\t';
+        *p++ = open ? 'O' : 'M'; *p++ = '\t';
         *p++ = m.enabled ? '1' : '0'; *p++ = '\t';
         p = PutHex(p, m.mods, 2); *p++ = '\t';
         p = PutHex(p, m.vk, 2); *p++ = '\t';
-        for (int e = 0; e < m.nEvt; ++e) {
-            p = PutHex(p, m.evt[e].vk, 2);
-            p = PutHex(p, m.evt[e].scan, 2);
-            p = PutHex(p, m.evt[e].flags, 2);
+        if (open) {
+            for (const WCHAR* s = m.target; *s; ++s) *p++ = (*s == '\t' || *s == '\r' || *s == '\n') ? L' ' : *s;
+        } else {
+            for (int e = 0; e < m.nEvt; ++e) {
+                p = PutHex(p, m.evt[e].vk, 2);
+                p = PutHex(p, m.evt[e].scan, 2);
+                p = PutHex(p, m.evt[e].flags, 2);
+            }
+            if (!m.nEvt) *p++ = '-';
         }
-        if (!m.nEvt) *p++ = '-';
         *p++ = '\t';
         for (const WCHAR* s = m.name; *s; ++s) *p++ = (*s == '\t' || *s == '\r' || *s == '\n') ? L' ' : *s;
         *p++ = '\r'; *p++ = '\n';
@@ -460,13 +627,16 @@ static void ParseConfig(WCHAR* p)
 
         if (line[0] == 'P' && nf >= 2) g_paused = f[1][0] == '1';
         else if (line[0] == 'H' && nf >= 2) g_hinted = f[1][0] == '1';
-        else if (line[0] == 'M' && nf == 6 && g_count < MAX_MACROS) {
+        else if ((line[0] == 'M' || line[0] == 'O') && nf == 6 && g_count < MAX_MACROS) {
             Macro& m = g_macros[g_count];
             ZeroMemory(&m, sizeof(m));
             m.enabled = f[1][0] == '1';
             m.mods = GetHex(f[2], 2) & (MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN);
             m.vk = GetHex(f[3], 2);
-            if (f[4][0] != '-') {
+            if (line[0] == 'O') {
+                m.action = ACT_OPEN;
+                lstrcpynW(m.target, f[4], TARGET_LEN);
+            } else if (f[4][0] != '-') {
                 int len = lstrlenW(f[4]);
                 for (int i = 0; i + 6 <= len && m.nEvt < MAX_EVT; i += 6) {
                     KeyEvt& e = m.evt[m.nEvt++];
